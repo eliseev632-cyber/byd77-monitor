@@ -8,11 +8,12 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # ВАЖНО: Разрешаем боту сохранять файлы
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-        with:
-          persist-credentials: true
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -29,6 +30,10 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add seen_txs.json
-          git commit -m "Update seen transactions state" || echo "No changes to commit"
-          git push
+          if [ -f seen_txs.json ]; then
+            git add seen_txs.json
+            git commit -m "Update seen transactions state" || echo "No changes to commit"
+            git push
+          else
+            echo "Файл состояния еще не создан, пропускаем сохранение"
+          fi
