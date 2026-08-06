@@ -2,174 +2,147 @@ import requests
 import os
 import json
 from datetime import datetime
-from decimal import Decimal
 
-# НАСТРОЙКИ
-WALLET = "0x88a132c7b2d1901d783ce3307adb36c78428618d"
-API_KEY = "4D8XAFU2PMJEMWXEYJ98FSFFVRQKRTM6P3"
-TELEGRAM_TOKEN = "8773525298:AAGm7xIUg9YaqsKD51v53AMxd1Ymt1NK-w"
-CHAT_ID = "1115922324"
+# ==== НАСТРОЙКИ (берутся из GitHub Secrets / переменных окружения) ====
+# ВАЖНО: больше НЕ храним токены прямо в коде. Задай их в
+# Settings -> Secrets and variables -> Actions репозитория.
+WALLET = os.environ.get("WALLET", "0x88a132c7b2d1901d783ce3307adb36c78428618d").lower()
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]      # обязателен
+CHAT_ID = os.environ["CHAT_ID"]                    # обязателен
 STATE_FILE = "seen_txs.json"
+
+# Сколько последних действий запрашивать за один проход
+ACTIVITY_LIMIT = 100
+# Какие типы активности считать «ставкой» и слать в Telegram
+NOTIFY_TYPES = {"TRADE"}   # при желании добавь "SPLIT", "MERGE", "REDEEM" и т.п.
+
 
 def load_seen():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r', encoding='utf-8') as f:
-            return set(json.load(f))
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            try:
+                return set(json.load(f))
+            except json.JSONDecodeError:
+                return set()
     return set()
 
+
 def save_seen(seen):
-    with open(STATE_FILE, 'w', encoding='utf-8') as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(list(seen), f)
+
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    params = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
-    try:
-        response = requests.post(url, params=params, timeout=10)
-        if response.status_code == 200:
-            print("✅ Уведомление отправлено в Telegram")
-        else:
-            print(f" Ошибка отправки: {response.status_code}")
-    except Exception as e:
-        print(f"❌ Ошибка Telegram: {e}")
-
-def get_polymarket_market(condition_id):
-    """Получаем информацию о рынке с Polymarket"""
-    try:
-        url = f"https://api.polymarket.com/conditons/{condition_id}"
-        response = requests.get(url, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-    except:
-        pass
-    return None
-
-def get_market_details(market_slug):
-    """Получаем детали рынка"""
-    try:
-        url = f"https://polymarket.com/{market_slug}"
-        # Пока не можем парсить HTML, но можно использовать API
-        return None
-    except:
-        pass
-    return None
-
-def get_transaction_details(tx_hash):
-    """Получаем детали транзакции с Polymarket API"""
-    try:
-        url = "https://data-api.polymarket.com/transactions"
-        params = {'hash': tx_hash}
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if data:
-                return data[0]
-    except:
-        pass
-    return None
-
-def format_usdc(amount_wei):
-    """Конвертируем wei в USDC (6 десятичных знаков)"""
-    usdc_amount = int(amount_wei) / 1_000_000  # USDC имеет 6 decimals
-    return f"${usdc_amount:,.2f}"
-
-def get_position_name(outcome_index):
-    """Определяем позицию YES/NO"""
-    # На Polymarket обычно 0 = YES, 1 = NO, но может быть иначе
-    outcomes = {0: "YES", 1: "NO", 2: "Outcome 3"}
-    return outcomes.get(outcome_index, f"Outcome {outcome_index + 1}")
-
-def get_transactions():
-    """Получаем последние транзакции кошелька"""
-    url = "https://api.etherscan.io/api"
     params = {
-        'module': 'account',
-        'action': 'txlist',
-        'address': WALLET,
-        'startblock': 0,
-        'endblock': 99999999,
-        'page': 1,
-        'offset': 20,
-        'sort': 'desc',
-        'apikey': API_KEY,
-        'chainId': 137
+        "chat_id": CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
     try:
-        response = requests.get(url, params=params, timeout=10)
-        data = response.json()
-        if data.get('status') == '1':
-            return data.get('result', [])
+        r = requests.post(url, data=params, timeout=15)
+        if r.status_code == 200:
+            print("Уведомление отправлено в Telegram")
+        else:
+            print(f"Ошибка отправки Telegram: {r.status_code} {r.text}")
     except Exception as e:
-        print(f"❌ Ошибка запроса к API: {e}")
+        print(f"Ошибка Telegram: {e}")
+
+
+def get_activity():
+    """Берём реальную активность кошелька напрямую с Polymarket Data API.
+
+    Именно этот источник показывает сделки. Etherscan txlist по EOA НЕ подходит:
+    Polymarket торгует через прокси-кошелёк (Safe) и релеер, поэтому ставки
+    не видны как обычные транзакции 'от кошелька к контракту Polymarket'.
+    """
+    url = "https://data-api.polymarket.com/activity"
+    params = {
+        "user": WALLET,
+        "limit": ACTIVITY_LIMIT,
+        "sortDirection": "DESC",
+    }
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+        print(f"Ошибка Polymarket API: {r.status_code}")
+    except Exception as e:
+        print(f"Ошибка запроса к Polymarket: {e}")
     return []
 
+
+def format_trade(a):
+    ts = datetime.fromtimestamp(int(a.get("timestamp", 0))).strftime("%Y-%m-%d %H:%M:%S")
+    title = a.get("title") or "Неизвестный рынок"
+    outcome = a.get("outcome") or "?"
+    side = (a.get("side") or "").upper()
+    side_label = {"BUY": "КУПИЛ (BUY)", "SELL": "ПРОДАЛ (SELL)"}.get(side, side or "TRADE")
+
+    usdc = a.get("usdcSize", 0) or 0
+    shares = a.get("size", 0) or 0
+    price = a.get("price", 0) or 0
+    try:
+        price_pct = f"{float(price) * 100:.1f}%"
+    except (TypeError, ValueError):
+        price_pct = "N/A"
+
+    tx = a.get("transactionHash", "")
+    slug = a.get("eventSlug") or a.get("slug") or ""
+    pm_link = f"https://polymarket.com/event/{slug}" if slug else "https://polymarket.com"
+
+    return (
+        f"НОВАЯ СДЕЛКА BYD77\n\n"
+        f"Рынок: {title}\n"
+        f"Исход: {outcome}\n"
+        f"{side_label}\n"
+        f"Сумма: ${float(usdc):,.2f}\n"
+        f"Доли: {float(shares):,.2f}\n"
+        f"Цена: {price_pct}\n"
+        f"Время: {ts}\n"
+        f'<a href="https://polygonscan.com/tx/{tx}">Транзакция</a> · '
+        f'<a href="{pm_link}">Рынок на Polymarket</a>\n\n'
+        f"@BYD77_monitor_bot"
+    )
+
+
 def main():
-    print(" Проверка новых сделок BYD77...")
+    print("Проверка новых сделок BYD77...")
     seen = load_seen()
-    txs = get_transactions()
-    POLYMARKET = "0x4d97dcd73ec5646b792f44472df76a9b62f0f7a2"
-    new_found = False
-    
-    for tx in txs:
-        if tx['hash'] not in seen and tx['to'].lower() == POLYMARKET.lower():
-            seen.add(tx['hash'])
-            new_found = True
-            
-            time_str = datetime.fromtimestamp(int(tx['timeStamp'])).strftime('%Y-%m-%d %H:%M:%S')
-            tx_hash = tx['hash']
-            value_usdc = format_usdc(tx['value'])
-            
-            # Пробуем получить детали с Polymarket API
-            pm_details = get_transaction_details(tx_hash)
-            
-            message = f"""
-🎯 <b>НОВАЯ СДЕЛКА BYD77!</b>
+    activity = get_activity()
 
- <b>Время:</b> {time_str}
-💰 <b>Сумма:</b> {value_usdc}
-🔗 <b>Транзакция:</b> <a href="https://polygonscan.com/tx/{tx_hash}">Посмотреть</a>
-"""
-            
-            if pm_details:
-                # Если получили детали с Polymarket
-                market_name = pm_details.get('market', 'Неизвестный рынок')
-                side = pm_details.get('side', 'Unknown')
-                shares = pm_details.get('shares', '0')
-                price = pm_details.get('price', '0')
-                
-                # Форматируем цену (на Polymarket цена в диапазоне 0-1)
-                try:
-                    price_percent = f"{float(price) * 100:.1f}%"
-                except:
-                    price_percent = "N/A"
-                
-                message += f"""
-📊 <b>Рынок:</b> {market_name[:100]}...
- <b>Позиция:</b> {'✅ YES' if side == 'YES' else '❌ NO'}
- <b>Вероятность:</b> {price_percent}
-🔢 <b>Доли:</b> {shares}
-"""
-            else:
-                # Если не получили детали, показываем базовую информацию
-                message += f"""
-️ <i>Детали ставки загружаются...</i>
-🔍 <a href="https://polymarket.com">Проверить на Polymarket</a>
-"""
-            
-            message += f"""
+    def key(a):
+        return f"{a.get('transactionHash','')}:{a.get('asset','')}:{a.get('side','')}"
 
-📱 <i>Мониторинг: @BYD77_monitor_bot</i>
-"""
-            
-            send_telegram(message)
-            print(f"✅ Отправлено: {tx_hash[:20]}...")
-    
+    first_run = len(seen) == 0
+
+    new_items = []
+    for a in activity:
+        if a.get("type") not in NOTIFY_TYPES:
+            continue
+        k = key(a)
+        if k in seen:
+            continue
+        seen.add(k)
+        new_items.append(a)
+
+    if first_run:
+        save_seen(seen)
+        print(f"Первый запуск: запомнил {len(seen)} событий, уведомления не слал.")
+        send_telegram("Бот BYD77 запущен и следит за кошельком. Жду новые сделки.")
+        return
+
+    for a in sorted(new_items, key=lambda x: int(x.get("timestamp", 0))):
+        send_telegram(format_trade(a))
+
     save_seen(seen)
-    
-    if not new_found:
-        print("️ Новых сделок нет")
+
+    if new_items:
+        print(f"Найдено и отправлено новых сделок: {len(new_items)}")
     else:
-        print(f"✅ Найдено новых сделок: {sum(1 for tx in txs if tx['hash'] in seen)}")
+        print("Новых сделок нет")
+
 
 if __name__ == "__main__":
     main()
